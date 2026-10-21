@@ -206,54 +206,56 @@ public class SwiftDeviceCalendarPlugin: NSObject, FlutterPlugin, EKEventViewDele
         result(hasPermissions)
     }
 
-    private func getSource() -> EKSource? {
-      let localSources = eventStore.sources.filter { $0.sourceType == .local }
-
-            if (!localSources.isEmpty) {
-                return localSources.first
-            }
-
-            if let defaultSource = eventStore.defaultCalendarForNewEvents?.source {
-                return defaultSource
-            }
-
-            let iCloudSources = eventStore.sources.filter { $0.sourceType == .calDAV && $0.sourceIdentifier == "iCloud" }
-
-            if (!iCloudSources.isEmpty) {
-                return iCloudSources.first
-            }
-
-            return nil
+    // Accounts to create a new calendar in, most preferred first. Accounts such
+    // as Gmail or some Exchange setups refuse new calendars, so createCalendar
+    // falls through to the next candidate when saving fails.
+    private func candidateSources() -> [EKSource] {
+        var candidates = eventStore.sources.filter { $0.sourceType == .local }
+        if let defaultSource = eventStore.defaultCalendarForNewEvents?.source {
+            candidates.append(defaultSource)
         }
+        candidates += eventStore.sources.filter { $0.sourceType == .calDAV && $0.title == "iCloud" }
+        candidates += eventStore.sources.filter { $0.sourceType == .calDAV || $0.sourceType == .exchange }
+
+        var seen = Set<String>()
+        return candidates.filter { seen.insert($0.sourceIdentifier).inserted }
+    }
 
     private func createCalendar(_ call: FlutterMethodCall, _ result: FlutterResult) {
         let arguments = call.arguments as! Dictionary<String, AnyObject>
-        let calendar = EKCalendar.init(for: EKEntityType.event, eventStore: eventStore)
-        do {
-            calendar.title = arguments[calendarNameArgument] as! String
-            let calendarColor = arguments[calendarColorArgument] as? String
+        let title = arguments[calendarNameArgument] as! String
+        let calendarColor = arguments[calendarColorArgument] as? String
 
+        let sources = candidateSources()
+        if sources.isEmpty {
+            result(FlutterError(code: self.genericError, message: "Local calendar was not found.", details: nil))
+            return
+        }
+
+        var lastError: Error?
+        for source in sources {
+            let calendar = EKCalendar.init(for: EKEntityType.event, eventStore: eventStore)
+            calendar.title = title
             if (calendarColor != nil) {
                 calendar.cgColor = UIColor(hex: calendarColor!)?.cgColor
             }
             else {
                 calendar.cgColor = UIColor(red: 255, green: 0, blue: 0, alpha: 0).cgColor // Red colour as a default
             }
+            calendar.source = source
 
-            guard let source = getSource() else {
-              result(FlutterError(code: self.genericError, message: "Local calendar was not found.", details: nil))
-              return
+            do {
+                try eventStore.saveCalendar(calendar, commit: true)
+                result(calendar.calendarIdentifier)
+                return
             }
-
-                calendar.source = source
-
-            try eventStore.saveCalendar(calendar, commit: true)
-            result(calendar.calendarIdentifier)
+            catch {
+                lastError = error
+                eventStore.reset()
+            }
         }
-        catch {
-            eventStore.reset()
-            result(FlutterError(code: self.genericError, message: error.localizedDescription, details: nil))
-        }
+
+        result(FlutterError(code: self.genericError, message: lastError?.localizedDescription ?? "Calendar could not be created.", details: nil))
     }
 
     private func updateCalendarColor(_ call: FlutterMethodCall, _ result: FlutterResult) {
